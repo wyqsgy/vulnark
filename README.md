@@ -1,4 +1,4 @@
-# wyqY - AI驱动的框架/中间件漏洞集合自动化验证平台
+# vulnark - AI驱动的框架/中间件漏洞集合自动化验证平台
 
 <p align="center">
   <strong>🛡️ 集成化 · 自动化 · AI驱动</strong>
