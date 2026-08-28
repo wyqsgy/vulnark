@@ -1,8 +1,11 @@
 import warnings
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.ai.engine import ai_engine
 from app.database import init_db
 from app.api import tasks, scans, reports, ws, export, cve, attack, recon, settings, pocs, verify, correlation, templates
 from app.middleware.exceptions import global_exception_handler
@@ -11,10 +14,23 @@ from app.utils.logger import get_logger
 
 logger = get_logger("wyqyan")
 
+APP_VERSION = "2.0.0"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    ai_engine.refresh_config()
+    logger.info(f"WyqYan v{APP_VERSION} started successfully")
+    yield
+    logger.info("WyqYan shutting down")
+
+
 app = FastAPI(
     title="WyqYan",
     description="AI驱动的框架/中间件漏洞集合自动化验证平台",
-    version="1.0.0",
+    version=APP_VERSION,
+    lifespan=lifespan,
 )
 
 app.middleware("http")(request_logger_middleware)
@@ -42,17 +58,11 @@ app.include_router(correlation.router)
 app.include_router(templates.router)
 
 
-@app.on_event("startup")
-def startup():
-    init_db()
-    logger.info("WyqYan started successfully")
-
-
 @app.get("/")
 def root():
     return {
         "name": "WyqYan",
-        "version": "1.0.0",
+        "version": APP_VERSION,
         "description": "AI驱动的框架/中间件漏洞集合自动化验证平台",
         "docs": "/docs",
     }
@@ -60,4 +70,5 @@ def root():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    ai_ready = ai_engine._is_available()
+    return {"status": "ok", "version": APP_VERSION, "ai_ready": ai_ready}

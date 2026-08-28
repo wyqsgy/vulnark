@@ -16,6 +16,8 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install -r backend/requirements.txt
+      - name: Run tests
+        run: cd backend && python -X utf8 -m pytest tests -q
       - name: Run import check
         run: cd backend && python -c "from app.main import app; print('FastAPI app created')"
 

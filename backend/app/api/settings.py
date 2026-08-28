@@ -3,6 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from app.ai.engine import ai_engine
 from app.database import get_db
 from app.models.settings import AIModelConfig, InfoGatheringKey, SystemSettings
 from app.utils.logger import get_logger
@@ -88,6 +89,7 @@ def create_ai_model(req: AIModelRequest, db: Session = Depends(get_db)):
     db.add(model)
     db.commit()
     db.refresh(model)
+    ai_engine.refresh_config()
     logger.info(f"AI model config created: {req.name}")
     return {"code": 200, "message": "AI模型配置已创建", "data": {"id": model.id}}
 
@@ -114,6 +116,7 @@ def update_ai_model(model_id: int, req: AIModelRequest, db: Session = Depends(ge
     model.is_default = req.is_default
     model.updated_at = datetime.utcnow()
     db.commit()
+    ai_engine.refresh_config()
     logger.info(f"AI model config updated: {req.name}")
     return {"code": 200, "message": "AI模型配置已更新"}
 
@@ -125,6 +128,7 @@ def delete_ai_model(model_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="AI模型配置不存在")
     db.delete(model)
     db.commit()
+    ai_engine.refresh_config()
     logger.info(f"AI model config deleted: id={model_id}")
     return {"code": 200, "message": "AI模型配置已删除"}
 

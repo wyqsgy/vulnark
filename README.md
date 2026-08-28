@@ -6,13 +6,25 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue?logo=python" />
-  <img src="https://img.shields.io/badge/fastapi-0.104-green?logo=fastapi" />
+  <img src="https://img.shields.io/badge/fastapi-0.116-green?logo=fastapi" />
   <img src="https://img.shields.io/badge/react-18-blue?logo=react" />
+  <img src="https://img.shields.io/badge/version-2.0.0-purple" />
   <img src="https://img.shields.io/badge/modules-27+-red" />
-  <img src="https://img.shields.io/badge/components-18-orange" />
   <img src="https://img.shields.io/badge/license-MIT-blue" />
   <img src="https://img.shields.io/badge/ai-powered-purple" />
 </p>
+
+## 🆕 v2.0.0 更新日志
+
+- **设置页模型配置真正生效**：修复「设置页保存的默认 AI 模型（DB 配置）从未被 AI 引擎读取」的断连问题——引擎现在优先使用 DB 默认模型配置，环境变量 `AI_*` 作为兜底，配置变更后热重载，无需重启
+- **修复 AI 引擎静默失效**：依赖清单缺失 `httpx`，导致 AI 客户端初始化 `ImportError` 被吞掉、AI 功能开箱即坏；现已补入
+- **推理模型兼容**：o1/o3/o4/GPT-5 系模型自动切换 `max_completion_tokens` 并忽略 `temperature`，不再 400
+- **LLM 调用重试**：429/5xx/超时按指数退避自动重试 3 次
+- **JSON 解析加固**：模型输出带前后缀文本、代码块包裹时均能正确解析
+- **依赖全面升级并修复真实 CVE**：`python-multipart 0.0.6 → 0.0.20`（CVE-2024-24762 ReDoS）、`aiohttp 3.9.1 → 3.12`、`fastapi 0.104 → 0.116` 等 13 项
+- **Docker 数据持久化修复**：compose 卷声明不匹配（`wyqy-data` 未声明）导致数据库数据随容器重建丢失；同时为后端增加健康检查、AI 配置透传
+- **CVE 知识库扩容**：新增 ActiveMQ (CVE-2023-46604)、Tomcat (CVE-2023-28708 / CVE-2024-50379)、Spring SpEL DoS (CVE-2023-20861)
+- **新增测试套件**：26 个用例覆盖 AI 引擎（JSON 解析/参数兼容/配置解析/降级模式）、扫描器注册完整性、CVE 库、报告生成器
 
 ## 简介
 

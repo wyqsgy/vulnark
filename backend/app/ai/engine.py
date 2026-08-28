@@ -1,24 +1,119 @@
+"""
+AI Analysis Engine v2.0.0 — OpenAI-compatible multi-provider LLM client.
+
+v2.0.0 upgrades:
+- DB-backed model config bridging: the default AIModelConfig saved from the
+  settings page is now actually used by the engine (env vars as fallback)
+- Retry with exponential backoff on 429/5xx/timeout
+- Reasoning-model compatibility (o1/o3/o4/gpt-5* -> max_completion_tokens,
+  temperature dropped)
+- Hardened JSON response parsing
+- Public call_ai() API (packet_verifier no longer needs private access)
+"""
 import json
 import os
+import threading
 import time
 from typing import Dict, List, Optional
+
 from app.config import AI_CONFIG
 from app.utils.logger import get_logger
 
 logger = get_logger("ai_engine")
 
+# 推理模型：不接受 temperature，且需要 max_completion_tokens
+_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
+
+
+def build_llm_kwargs(
+    model: str,
+    temperature: float = 0.1,
+    max_tokens: int = 1024,
+) -> Dict:
+    """按模型能力构造 chat/completions 请求参数。"""
+    model_l = (model or "").lower()
+    if any(model_l.startswith(p) for p in _REASONING_MODEL_PREFIXES):
+        return {
+            "model": model,
+            "max_completion_tokens": max_tokens,
+        }
+    return {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
 
 class AIAnalysisEngine:
     def __init__(self):
-        self.config = AI_CONFIG
-        self.client = None
+        self._lock = threading.Lock()
+        self.config: Dict = dict(AI_CONFIG)
+        self.http_client = None
         self._init_client()
 
+    # ------------------------------------------------------------------
+    # 配置解析：DB 默认模型配置 -> 环境变量兜底
+    # ------------------------------------------------------------------
+    def refresh_config(self) -> Dict:
+        """重新加载生效配置。优先使用设置页保存的默认 AI 模型（DB），
+        其次回退到环境变量 AI_* 配置。启动时与设置变更后调用。"""
+        with self._lock:
+            db_cfg = self._load_db_config()
+            if db_cfg:
+                self.config = db_cfg
+                logger.info(f"AI config loaded from DB: {db_cfg['model']} @ {db_cfg['api_base']}")
+            else:
+                self.config = dict(AI_CONFIG)
+                logger.info("AI config loaded from environment defaults")
+            self._init_client()
+            return {k: v for k, v in self.config.items() if k != "api_key"}
+
+    def _load_db_config(self) -> Optional[Dict]:
+        """从数据库读取默认启用的 AI 模型配置；失败时返回 None。"""
+        try:
+            from app.database import SessionLocal
+            from app.models.settings import AIModelConfig
+
+            db = SessionLocal()
+            try:
+                model = (
+                    db.query(AIModelConfig)
+                    .filter(AIModelConfig.is_enabled == True, AIModelConfig.is_default == True)  # noqa: E712
+                    .first()
+                )
+                if model is None:
+                    model = (
+                        db.query(AIModelConfig)
+                        .filter(AIModelConfig.is_enabled == True)  # noqa: E712
+                        .first()
+                    )
+                if model is None or not (model.api_key or "").strip():
+                    return None
+                return {
+                    "enabled": True,
+                    "provider": model.provider,
+                    "api_key": model.api_key,
+                    "api_base": (model.api_base or "").rstrip("/"),
+                    "model": model.model_name,
+                    "temperature": float(model.temperature or 0.1),
+                    "max_tokens": int(model.max_tokens or 1024),
+                    "timeout": int(model.timeout or 60),
+                }
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug(f"DB AI config unavailable ({e}), falling back to env")
+            return None
+
     def _init_client(self):
-        if not self.config["enabled"]:
+        self.http_client = None
+        if not self.config.get("enabled") or not self.config.get("api_key"):
+            return
+        if not self.config.get("api_base"):
             return
         try:
             import httpx
+
             self.http_client = httpx.Client(
                 base_url=self.config["api_base"],
                 timeout=self.config["timeout"],
@@ -30,6 +125,83 @@ class AIAnalysisEngine:
         except Exception as e:
             logger.error(f"AI client init failed: {e}")
 
+    def _is_available(self) -> bool:
+        return (
+            self.config.get("enabled")
+            and bool(self.config.get("api_key"))
+            and self.http_client is not None
+        )
+
+    # ------------------------------------------------------------------
+    # LLM 调用
+    # ------------------------------------------------------------------
+    def call_ai(self, prompt: str, task_type: str) -> Dict:
+        """调用 LLM 并解析 JSON 响应，带指数退避重试（线程安全）。"""
+        if not self._is_available():
+            return {"error": "AI not configured", "status": "fallback_mode"}
+
+        kwargs = build_llm_kwargs(
+            self.config["model"],
+            temperature=float(self.config.get("temperature", 0.1)),
+            max_tokens=int(self.config.get("max_tokens", 1024)),
+        )
+        kwargs["messages"] = [
+            {"role": "system", "content": "你是一个专业的网络安全分析AI，只返回JSON格式数据。"},
+            {"role": "user", "content": prompt},
+        ]
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = self.http_client.post("/chat/completions", json=kwargs)
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result["choices"][0]["message"]["content"]
+                    return self._parse_json_response(content)
+                # 429/5xx 可重试；4xx 参数错误不重试
+                if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    time.sleep(1.5 * (2 ** attempt))
+                    continue
+                logger.error(f"AI API error: {response.status_code} {response.text[:200]}")
+                return {"error": f"API error: {response.status_code}"}
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(1.5 * (2 ** attempt))
+                    continue
+
+        logger.error(f"AI call failed: {last_error}")
+        return {"error": str(last_error)}
+
+    # 兼容旧调用（packet_verifier 曾直接访问私有方法）
+    def _call_ai(self, prompt: str, task_type: str) -> Dict:
+        return self.call_ai(prompt, task_type)
+
+    @staticmethod
+    def _parse_json_response(content: str) -> Dict:
+        """健壮的 JSON 解析：代码块包裹 -> 直接解析 -> 首尾花括号截取。"""
+        if not content:
+            return {}
+        text = content.strip()
+        candidates = []
+        if "```json" in text:
+            candidates.append(text.split("```json")[1].split("```")[0])
+        elif "```" in text:
+            candidates.append(text.split("```")[1].split("```")[0])
+        candidates.append(text)
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            candidates.append(text[start:end + 1])
+        for cand in candidates:
+            try:
+                return json.loads(cand.strip())
+            except (json.JSONDecodeError, ValueError):
+                continue
+        return {"raw_response": text}
+
+    # ------------------------------------------------------------------
+    # 分析能力（未配置 AI 时优雅降级）
+    # ------------------------------------------------------------------
     def analyze_fingerprint(self, fingerprint_data: Dict) -> Dict:
         if not self._is_available():
             return self._fallback_fingerprint(fingerprint_data)
@@ -43,7 +215,7 @@ class AIAnalysisEngine:
     "attack_surface": "攻击面分析",
     "priority_targets": ["优先检测目标"]
 }}"""
-        return self._call_ai(prompt, "fingerprint_analysis")
+        return self.call_ai(prompt, "fingerprint_analysis")
 
     def analyze_vulnerability(self, vuln_data: Dict) -> Dict:
         if not self._is_available():
@@ -61,7 +233,7 @@ class AIAnalysisEngine:
     "attack_chain": "可能的攻击链",
     "evidence_quality": "证据质量评估"
 }}"""
-        return self._call_ai(prompt, "vuln_analysis")
+        return self.call_ai(prompt, "vuln_analysis")
 
     def adapt_payload(self, payload: str, context: Dict) -> Dict:
         if not self._is_available():
@@ -75,7 +247,7 @@ class AIAnalysisEngine:
     "techniques_used": ["使用的技术"],
     "explanation": "解释"
 }}"""
-        return self._call_ai(prompt, "payload_adaptation")
+        return self.call_ai(prompt, "payload_adaptation")
 
     def detect_false_positive(self, vuln_data: Dict, response_data: Dict) -> Dict:
         if not self._is_available():
@@ -90,7 +262,7 @@ class AIAnalysisEngine:
     "reasoning": "判断依据",
     "suggestion": "建议"
 }}"""
-        return self._call_ai(prompt, "false_positive_detection")
+        return self.call_ai(prompt, "false_positive_detection")
 
     def generate_remediation(self, vuln_list: List[Dict]) -> Dict:
         if not self._is_available():
@@ -105,7 +277,7 @@ class AIAnalysisEngine:
     "configuration_changes": ["配置变更建议"],
     "code_changes": ["代码层面修复建议"]
 }}"""
-        return self._call_ai(prompt, "remediation")
+        return self.call_ai(prompt, "remediation")
 
     def classify_target(self, url: str, response_data: Dict) -> Dict:
         if not self._is_available():
@@ -123,44 +295,11 @@ URL: {url}
     "recommended_scans": ["推荐的扫描模块"],
     "risk_level": "预估风险等级"
 }}"""
-        return self._call_ai(prompt, "target_classification")
+        return self.call_ai(prompt, "target_classification")
 
-    def _call_ai(self, prompt: str, task_type: str) -> Dict:
-        try:
-            payload = {
-                "model": self.config["model"],
-                "messages": [
-                    {"role": "system", "content": "你是一个专业的网络安全分析AI，只返回JSON格式数据。"},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": self.config["temperature"],
-                "max_tokens": self.config["max_tokens"],
-            }
-            response = self.http_client.post("/chat/completions", json=payload)
-            if response.status_code == 200:
-                result = response.json()
-                content = result["choices"][0]["message"]["content"]
-                return self._parse_json_response(content)
-            else:
-                logger.error(f"AI API error: {response.status_code}")
-                return {"error": f"API error: {response.status_code}"}
-        except Exception as e:
-            logger.error(f"AI call failed: {e}")
-            return {"error": str(e)}
-
-    def _parse_json_response(self, content: str) -> Dict:
-        try:
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0]
-            return json.loads(content.strip())
-        except json.JSONDecodeError:
-            return {"raw_response": content}
-
-    def _is_available(self) -> bool:
-        return self.config["enabled"] and self.config.get("api_key") and hasattr(self, "http_client")
-
+    # ------------------------------------------------------------------
+    # 降级响应
+    # ------------------------------------------------------------------
     def _fallback_fingerprint(self, data: Dict) -> Dict:
         return {
             "tech_stack": [fw["name"] for fw in data.get("framework", [])],
@@ -194,4 +333,5 @@ URL: {url}
         }
 
 
+# 全局单例（配置延迟加载：启动后由 main.py 调用 refresh_config 从 DB 读取）
 ai_engine = AIAnalysisEngine()
