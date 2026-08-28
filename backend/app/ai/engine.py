@@ -10,12 +10,26 @@ import threading
 import time
 from typing import AsyncGenerator, Dict, List, Optional
 
-from aicompat import build_llm_kwargs, parse_json_response  # noqa: F401  (re-export)
+from aicompat import (  # noqa: F401  (build_llm_kwargs re-export)
+    RETRYABLE_STATUS,
+    aretry_stream,
+    build_llm_kwargs,
+    parse_json_response,
+    retry,
+)
 
 from app.config import AI_CONFIG
 from app.utils.logger import get_logger
 
 logger = get_logger("ai_engine")
+
+
+class AIStatusError(Exception):
+    """携带 HTTP 状态码的 AI 网关错误，用于判断是否可重试。"""
+
+    def __init__(self, status: int, detail: str = ""):
+        super().__init__(f"API error: {status} {detail}")
+        self.status = status
 
 
 class AIAnalysisEngine:
@@ -110,7 +124,11 @@ class AIAnalysisEngine:
     # LLM 调用
     # ------------------------------------------------------------------
     def call_ai(self, prompt: str, task_type: str) -> Dict:
-        """调用 LLM 并解析 JSON 响应，带指数退避重试（线程安全）。"""
+        """调用 LLM 并解析 JSON 响应（线程安全）。
+
+        重试统一由 aicompat.retry 承担：429/5xx/超时按指数退避重试，
+        4xx 参数错误不重试。失败时返回 {"error": ...} 而非抛出。
+        """
         if not self._is_available():
             return {"error": "AI not configured", "status": "fallback_mode"}
 
@@ -124,28 +142,27 @@ class AIAnalysisEngine:
             {"role": "user", "content": prompt},
         ]
 
-        last_error = None
-        for attempt in range(3):
-            try:
-                response = self.http_client.post("/chat/completions", json=kwargs)
-                if response.status_code == 200:
-                    result = response.json()
-                    content = result["choices"][0]["message"]["content"]
-                    return self._parse_json_response(content)
-                # 429/5xx 可重试；4xx 参数错误不重试
-                if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
-                    time.sleep(1.5 * (2 ** attempt))
-                    continue
-                logger.error(f"AI API error: {response.status_code} {response.text[:200]}")
-                return {"error": f"API error: {response.status_code}"}
-            except Exception as e:
-                last_error = e
-                if attempt < 2:
-                    time.sleep(1.5 * (2 ** attempt))
-                    continue
+        def _attempt():
+            response = self.http_client.post("/chat/completions", json=kwargs)
+            if response.status_code == 200:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+                return self._parse_json_response(content)
+            raise AIStatusError(response.status_code, response.text[:200])
 
-        logger.error(f"AI call failed: {last_error}")
-        return {"error": str(last_error)}
+        def _can_retry(e: Exception) -> bool:
+            if isinstance(e, AIStatusError):
+                return e.status in RETRYABLE_STATUS
+            return True  # 网络类异常默认可重试
+
+        try:
+            return retry(_attempt, retries=3, base_delay=1.5, retry_on=_can_retry)
+        except AIStatusError as e:
+            logger.error(f"AI API error: {e}")
+            return {"error": str(e)}
+        except Exception as e:
+            logger.error(f"AI call failed: {e}")
+            return {"error": str(e)}
 
     # 兼容旧调用（packet_verifier 曾直接访问私有方法）
     def _call_ai(self, prompt: str, task_type: str) -> Dict:
@@ -159,7 +176,9 @@ class AIAnalysisEngine:
     async def call_ai_stream(self, prompt: str, task_type: str) -> AsyncGenerator[dict, None]:
         """流式调用 LLM，逐 token 产出 {"type": "token"|"done"|"error", ...}。
 
-        用于 AI 报告的流式生成；未配置 AI 时直接产出错误事件。
+        重试统一由 aicompat.aretry_stream 承担：仅在产出任何 token 之前
+        重试（429/5xx/网络错误），产出后异常直接抛出并转为 error 事件。
+        未配置 AI 时直接产出错误事件。
         """
         if not self._is_available():
             yield {"type": "error", "error": "AI not configured", "status": "fallback_mode"}
@@ -178,6 +197,27 @@ class AIAnalysisEngine:
             {"role": "user", "content": prompt},
         ]
 
+        def _can_retry(e: Exception) -> bool:
+            if isinstance(e, AIStatusError):
+                return e.status in RETRYABLE_STATUS
+            return isinstance(e, httpx.HTTPError)
+
+        try:
+            async for event in aretry_stream(
+                lambda: self._stream_once(kwargs),
+                retries=3,
+                base_delay=1.0,
+                retry_on=_can_retry,
+            ):
+                yield event
+        except Exception as e:
+            logger.error(f"AI stream failed: {e}")
+            yield {"type": "error", "error": str(e)}
+
+    async def _stream_once(self, kwargs: Dict) -> AsyncGenerator[dict, None]:
+        """单次流式尝试。产出任何 token 前的失败以异常抛出（供重试判定）。"""
+        import httpx
+
         client = httpx.AsyncClient(
             base_url=self.config["api_base"],
             timeout=self.config["timeout"],
@@ -188,8 +228,7 @@ class AIAnalysisEngine:
             async with client.stream("POST", "/chat/completions", json=kwargs) as response:
                 if response.status_code != 200:
                     body = (await response.aread()).decode(errors="replace")[:300]
-                    yield {"type": "error", "error": f"API error: {response.status_code} {body}"}
-                    return
+                    raise AIStatusError(response.status_code, body)
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue
@@ -206,12 +245,9 @@ class AIAnalysisEngine:
                         produced = True
                         yield {"type": "token", "content": content}
             if not produced:
-                yield {"type": "error", "error": "stream produced no content"}
-            else:
-                yield {"type": "done"}
-        except Exception as e:
-            logger.error(f"AI stream failed: {e}")
-            yield {"type": "error", "error": str(e)}
+                # 空流视为可重试的网关错误
+                raise AIStatusError(502, "stream produced no content")
+            yield {"type": "done"}
         finally:
             await client.aclose()
 

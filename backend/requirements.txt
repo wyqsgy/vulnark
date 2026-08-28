@@ -13,4 +13,4 @@ psutil==7.0.0
 httpx==0.28.1
 pytest>=8.0
 pytest-asyncio>=0.23
-aicompat @ git+https://github.com/wyqsgy/aicompat.git@v1.0.0
+aicompat @ git+https://github.com/wyqsgy/aicompat.git@v1.1.0aicompat pin check
