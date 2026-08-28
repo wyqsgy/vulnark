@@ -1,47 +1,21 @@
 """
-AI Analysis Engine v2.0.0 — OpenAI-compatible multi-provider LLM client.
+AI Analysis Engine v2.1 — OpenAI-compatible multi-provider LLM client.
 
-v2.0.0 upgrades:
-- DB-backed model config bridging: the default AIModelConfig saved from the
-  settings page is now actually used by the engine (env vars as fallback)
-- Retry with exponential backoff on 429/5xx/timeout
-- Reasoning-model compatibility (o1/o3/o4/gpt-5* -> max_completion_tokens,
-  temperature dropped)
-- Hardened JSON response parsing
-- Public call_ai() API (packet_verifier no longer needs private access)
+- DB-backed model config bridging (env vars as fallback, hot reload)
+- 统一走 aicompat 兼容层：推理模型参数兼容 / 健壮 JSON 解析
+- call_ai_stream: SSE 流式调用（用于 AI 报告流式生成）
 """
 import json
-import os
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
+
+from aicompat import build_llm_kwargs, parse_json_response  # noqa: F401  (re-export)
 
 from app.config import AI_CONFIG
 from app.utils.logger import get_logger
 
 logger = get_logger("ai_engine")
-
-# 推理模型：不接受 temperature，且需要 max_completion_tokens
-_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
-
-
-def build_llm_kwargs(
-    model: str,
-    temperature: float = 0.1,
-    max_tokens: int = 1024,
-) -> Dict:
-    """按模型能力构造 chat/completions 请求参数。"""
-    model_l = (model or "").lower()
-    if any(model_l.startswith(p) for p in _REASONING_MODEL_PREFIXES):
-        return {
-            "model": model,
-            "max_completion_tokens": max_tokens,
-        }
-    return {
-        "model": model,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
 
 
 class AIAnalysisEngine:
@@ -179,25 +153,67 @@ class AIAnalysisEngine:
 
     @staticmethod
     def _parse_json_response(content: str) -> Dict:
-        """健壮的 JSON 解析：代码块包裹 -> 直接解析 -> 首尾花括号截取。"""
-        if not content:
-            return {}
-        text = content.strip()
-        candidates = []
-        if "```json" in text:
-            candidates.append(text.split("```json")[1].split("```")[0])
-        elif "```" in text:
-            candidates.append(text.split("```")[1].split("```")[0])
-        candidates.append(text)
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end > start:
-            candidates.append(text[start:end + 1])
-        for cand in candidates:
-            try:
-                return json.loads(cand.strip())
-            except (json.JSONDecodeError, ValueError):
-                continue
-        return {"raw_response": text}
+        """健壮的 JSON 解析（委托给 aicompat 统一实现）。"""
+        return parse_json_response(content or "")
+
+    async def call_ai_stream(self, prompt: str, task_type: str) -> AsyncGenerator[dict, None]:
+        """流式调用 LLM，逐 token 产出 {"type": "token"|"done"|"error", ...}。
+
+        用于 AI 报告的流式生成；未配置 AI 时直接产出错误事件。
+        """
+        if not self._is_available():
+            yield {"type": "error", "error": "AI not configured", "status": "fallback_mode"}
+            return
+
+        import httpx
+
+        kwargs = build_llm_kwargs(
+            self.config["model"],
+            temperature=float(self.config.get("temperature", 0.1)),
+            max_tokens=max(int(self.config.get("max_tokens", 1024)), 4096),
+            stream=True,
+        )
+        kwargs["messages"] = [
+            {"role": "system", "content": "你是一个专业的网络安全分析AI。"},
+            {"role": "user", "content": prompt},
+        ]
+
+        client = httpx.AsyncClient(
+            base_url=self.config["api_base"],
+            timeout=self.config["timeout"],
+            headers={"Authorization": f"Bearer {self.config['api_key']}"},
+        )
+        produced = False
+        try:
+            async with client.stream("POST", "/chat/completions", json=kwargs) as response:
+                if response.status_code != 200:
+                    body = (await response.aread()).decode(errors="replace")[:300]
+                    yield {"type": "error", "error": f"API error: {response.status_code} {body}"}
+                    return
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload)
+                        delta = chunk["choices"][0].get("delta") or {}
+                        content = delta.get("content")
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+                    if content:
+                        produced = True
+                        yield {"type": "token", "content": content}
+            if not produced:
+                yield {"type": "error", "error": "stream produced no content"}
+            else:
+                yield {"type": "done"}
+        except Exception as e:
+            logger.error(f"AI stream failed: {e}")
+            yield {"type": "error", "error": str(e)}
+        finally:
+            await client.aclose()
 
     # ------------------------------------------------------------------
     # 分析能力（未配置 AI 时优雅降级）

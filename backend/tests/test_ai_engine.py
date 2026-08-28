@@ -44,7 +44,7 @@ class TestParseJsonResponse:
         assert out == {"raw_response": "这不是JSON"}
 
     def test_empty(self):
-        assert self.engine._parse_json_response("") == {}
+        assert self.engine._parse_json_response("") == {"raw_response": ""}
 
 
 class TestEngineDegradedMode:

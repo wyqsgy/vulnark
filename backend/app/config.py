@@ -11,6 +11,16 @@ HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "10"))
 MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "5"))
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+# --- 访问鉴权 ---
+# 设置后所有 /api/* 请求必须携带凭据（Authorization: Bearer <token> 或 X-API-Token 头，
+# WebSocket 用 ?token=<token>）。留空 = 不启用鉴权（仅建议内网使用）。
+API_TOKEN = os.getenv("API_TOKEN", "")
+
+# --- 扫描目标白名单（授权范围控制） ---
+# 逗号分隔：支持 CIDR（10.0.0.0/8）、精确 IP/域名、通配符域名（*.example.com）。
+# 条目 "example.com" 同时放行其子域。留空 = 不限制（公网部署强烈建议设置）。
+ALLOWED_SCAN_TARGETS = [t.strip() for t in os.getenv("ALLOWED_SCAN_TARGETS", "").split(",") if t.strip()]
+
 SCAN_CATEGORIES = {
     "spring": {
         "name": "Spring Framework",

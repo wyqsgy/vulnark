@@ -3,8 +3,10 @@ warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import app.config as config_mod
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from app.ai.engine import ai_engine
 from app.database import init_db
 from app.api import tasks, scans, reports, ws, export, cve, attack, recon, settings, pocs, verify, correlation, templates
@@ -14,7 +16,7 @@ from app.utils.logger import get_logger
 
 logger = get_logger("wyqyan")
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 @asynccontextmanager
@@ -34,6 +36,27 @@ app = FastAPI(
 )
 
 app.middleware("http")(request_logger_middleware)
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """可选 API 鉴权：设置 API_TOKEN 后，/api/*（除健康检查）必须携带凭据。"""
+    token = config_mod.API_TOKEN
+    if token and request.url.path.startswith("/api/") and request.url.path != "/api/health":
+        provided = request.headers.get("X-API-Token", "")
+        if not provided:
+            auth = request.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                provided = auth[7:]
+        if provided != token:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized: missing or invalid API token"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await call_next(request)
+
+
 app.add_exception_handler(Exception, global_exception_handler)
 app.add_middleware(
     CORSMiddleware,

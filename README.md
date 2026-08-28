@@ -14,6 +14,15 @@
   <img src="https://img.shields.io/badge/ai-powered-purple" />
 </p>
 
+## 🆕 v2.1.0 更新日志
+
+- **AI 流式报告**：`POST /api/reports/ai-generate-stream/{task_id}` 以 SSE 逐 token 输出 LLM 撰写的渗透测试叙事报告（执行摘要 / 风险概览 / 详细发现 / 修复路线图），前端报告页一键生成实时流式渲染
+- **可选 API 鉴权**：设置 `API_TOKEN` 后所有 `/api/*` 需携带凭据，公网部署必备；留空保持内网免鉴权
+- **扫描目标白名单**：设置 `ALLOWED_SCAN_TARGETS`（支持 CIDR / 精确 IP / 通配符域名）后，任务创建接口拒绝授权范围外目标，防止平台被滥用为攻击跳板
+- **共享兼容层**：AI 引擎统一走 [aicompat](https://github.com/wyqsgy/aicompat)（推理模型参数 / JSON 解析）
+- 修复报告页「查看报告」指向不存在路由的问题（`/api/v1/...` → `/api/reports/{id}/html`）
+- 新增 9 个鉴权 / 白名单测试（共 35 个）
+
 ## 🆕 v2.0.0 更新日志
 
 - **设置页模型配置真正生效**：修复「设置页保存的默认 AI 模型（DB 配置）从未被 AI 引擎读取」的断连问题——引擎现在优先使用 DB 默认模型配置，环境变量 `AI_*` 作为兜底，配置变更后热重载，无需重启

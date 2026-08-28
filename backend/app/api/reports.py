@@ -1,6 +1,9 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
+from app.ai.engine import ai_engine
 from app.database import get_db
 from app.models.task import ScanTask, TaskStatus
 from app.models.vulnerability import Vulnerability
@@ -10,6 +13,52 @@ from app.utils.helper import gen_report_id
 from app.config import RISK_LEVELS
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
+
+
+def _collect_task_payload(db: Session, task: ScanTask) -> dict:
+    """汇总任务漏洞数据（供 AI 报告 prompt 使用）。"""
+    vulns = db.query(Vulnerability).filter(Vulnerability.task_id == task.task_id).all()
+    vuln_list = [{
+        "name": v.name,
+        "risk_level": v.risk_level,
+        "target_url": v.target_url,
+        "description": v.description,
+        "payload": v.payload,
+        "cve_ids": v.cve_ids or [],
+        "fix_suggestion": v.fix_suggestion,
+    } for v in vulns]
+    return {
+        "target": task.target,
+        "total": len(vuln_list),
+        "vulnerabilities": vuln_list,
+    }
+
+
+@router.post("/ai-generate-stream/{task_id}")
+async def ai_generate_report_stream(task_id: str, db: Session = Depends(get_db)):
+    """AI 流式安全报告：SSE 逐 token 输出 LLM 撰写的渗透测试叙事报告。"""
+    task = db.query(ScanTask).filter(ScanTask.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    payload = _collect_task_payload(db, task)
+    prompt = f"""你是一个资深渗透测试报告撰写专家。基于以下扫描结果，撰写一份专业安全评估报告（Markdown 格式）：
+1) 执行摘要（面向管理层，2-3 句）
+2) 风险概览（按 critical > high > medium > low 统计）
+3) 详细发现（每个漏洞：描述、验证证据、危害、修复建议）
+4) 整体修复路线图（立即/短期/长期）
+
+扫描数据: {json.dumps(payload, ensure_ascii=False)[:6000]}"""
+
+    async def event_stream():
+        async for event in ai_engine.call_ai_stream(prompt, "report_generation"):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/generate/{task_id}")

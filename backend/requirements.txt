@@ -1,4 +1,4 @@
-fastapi==0.116.1
+﻿fastapi==0.116.1
 uvicorn[standard]==0.35.0
 websockets==15.0.1
 sqlalchemy==2.0.41
@@ -13,3 +13,4 @@ psutil==7.0.0
 httpx==0.28.1
 pytest>=8.0
 pytest-asyncio>=0.23
+aicompat @ git+https://github.com/wyqsgy/aicompat.git@v1.0.0

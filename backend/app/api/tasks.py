@@ -2,6 +2,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from app.core.target_guard import validate_scan_target
 from app.database import get_db
 from app.models.task import ScanTask, TaskStatus
 from app.scanner.engine import start_scan, stop_scan
@@ -39,6 +40,13 @@ class TaskResponse(BaseModel):
 
 @router.post("")
 def create_task(req: CreateTaskRequest, db: Session = Depends(get_db)):
+    # 授权范围校验：设置 ALLOWED_SCAN_TARGETS 后仅放行白名单内目标
+    if not validate_scan_target(req.target):
+        raise HTTPException(
+            status_code=403,
+            detail=f"目标 {req.target} 不在授权扫描范围内（ALLOWED_SCAN_TARGETS）",
+        )
+
     task_id = gen_task_id()
 
     categories = req.categories
